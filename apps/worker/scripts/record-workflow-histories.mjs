@@ -1,5 +1,7 @@
 // Usage: npm run temporal:record-histories -w @space/worker [-- --patched-change]
-import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { copyFile, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -30,7 +32,13 @@ try {
     const expected = ["dotGoalWorkflow", "dummyTurnWorkflow", "codexAppServerTurnWorkflow", "roomAgentSupervisorWorkflow", "roomAgentSupervisorWorkflow-legacy", "roomAgentActionWorkflow", "memoryMaintenanceWorkflow", "memoryConsolidationWorkflow", "memoryMutationWorkflow"].map((name) => `${name}.json`);
     const recorded = await readdir(staging);
     for (const file of expected) if (!recorded.includes(file)) throw new Error(`Recorder did not produce ${file}`);
-    for (const file of expected) await rename(join(staging, file), join(target, file));
+    for (const file of expected) {
+      if (files.includes(file)) {
+        const archive = `${file.slice(0, -5)}-pre-${randomUUID()}.json`;
+        await copyFile(join(target, file), join(target, archive), constants.COPYFILE_EXCL);
+      }
+      await rename(join(staging, file), join(target, file));
+    }
   }
 } finally {
   await rm(staging, { recursive: true, force: true });

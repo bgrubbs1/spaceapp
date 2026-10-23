@@ -31,6 +31,12 @@ before using the explicit `-- --patched-change` argument. Preserve coverage of
 old executions when adding new patch histories. Ordinary tests never write or
 replace these fixtures.
 
+Before publishing a replacement, `--patched-change` copies the existing fixture
+unchanged to `<workflow>-pre-<unique-id>.json` in this directory. Every archived
+history remains in the default replay discovery, with its original workflow ID.
+Archives are never overwritten, including on repeated recordings. Duplicate
+workflow IDs across current and archived fixtures still fail replay validation.
+
 For an approved patch change, run:
 
 ```sh
