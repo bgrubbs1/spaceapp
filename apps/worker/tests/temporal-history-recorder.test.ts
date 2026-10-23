@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const workflowNames = [
@@ -48,14 +49,61 @@ async function record(
   recorder: Awaited<ReturnType<typeof createRecorder>>,
   contents: Record<string, string>,
   args: string[] = [],
-  exitCode = 0
+  exitCode = 0,
+  nodeArguments: string[] = []
 ) {
   await writeFile(join(recorder.root, "recording.json"), JSON.stringify({ fixtures: contents, exitCode }));
-  return spawnSync(process.execPath, [recorder.script, ...args], {
+  return spawnSync(process.execPath, [...nodeArguments, recorder.script, ...args], {
     cwd: recorder.root,
     encoding: "utf8",
     timeout: 15_000
   });
+}
+
+async function recorderFaults(
+  recorder: Awaited<ReturnType<typeof createRecorder>>,
+  options: { publication?: boolean; archiveCleanup?: boolean; archiveWrite?: boolean; stagingCleanup?: boolean } = {}
+) {
+  const hook = join(recorder.root, "recorder-faults.mjs");
+  await writeFile(hook, `
+    import fs from "node:fs/promises";
+    import crypto from "node:crypto";
+    import { syncBuiltinESMExports } from "node:module";
+    import { basename } from "node:path";
+    crypto.randomUUID = () => "test-id";
+    const open = fs.open;
+    fs.open = async (path, flags, ...args) => {
+      const handle = await open(path, flags, ...args);
+      if (${Boolean(options.archiveWrite)} && flags === "wx" && String(path).endsWith("dotGoalWorkflow-pre-test-id.json")) {
+        const writeFile = handle.writeFile.bind(handle);
+        handle.writeFile = async () => {
+          await writeFile("partial archive");
+          throw Object.assign(new Error("archive-write-original-error"), { code: "EARCHIVE" });
+        };
+      }
+      return handle;
+    };
+    const rename = fs.rename;
+    fs.rename = async (source, target) => {
+      if (${Boolean(options.publication)} && String(target).endsWith("dotGoalWorkflow.json")) {
+        throw Object.assign(new Error("fixture-publication-original-error"), { code: "EPUBLISH" });
+      }
+      return rename(source, target);
+    };
+    const rm = fs.rm;
+    fs.rm = async (path, options) => {
+      if (${Boolean(options.archiveCleanup)} && String(path).endsWith("dotGoalWorkflow-pre-test-id.json")) {
+        throw Object.assign(new Error("archive-cleanup-secondary-error"), { code: "ECLEANUP" });
+      }
+      const result = await rm(path, options);
+      if (${Boolean(options.stagingCleanup)} && basename(String(path)).startsWith(".record-")) {
+        throw Object.assign(new Error("staging-cleanup-secondary-error"), { code: "ESTAGING" });
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+  `);
+  return ["--import", pathToFileURL(hook).href];
 }
 
 async function snapshot(directory: string) {
@@ -108,5 +156,73 @@ describe("workflow history recorder publication", () => {
     const result = await record(recorder, replacement, ["--patched-change"], failure === "failed" ? 1 : 0);
     expect(result.status).not.toBe(0);
     expect(await snapshot(recorder.histories)).toEqual(initial);
+  });
+
+  it("removes only the newly created archive when publication fails", async () => {
+    const recorder = await createRecorder();
+    expect((await record(recorder, fixtures(1))).status).toBe(0);
+    await writeFile(join(recorder.histories, "dotGoalWorkflow-pre-older-id.json"), fixtures(0)["dotGoalWorkflow.json"]!);
+    const before = await snapshot(recorder.histories);
+    const hook = await recorderFaults(recorder, { publication: true });
+    const result = await record(recorder, fixtures(2), ["--patched-change"], 0, hook);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("fixture-publication-original-error");
+    expect(result.stderr).toContain("EPUBLISH");
+    expect(await snapshot(recorder.histories)).toEqual(before);
+  });
+
+  it("retains a pre-existing archive when exclusive archival collides", async () => {
+    const recorder = await createRecorder();
+    expect((await record(recorder, fixtures(1))).status).toBe(0);
+    await writeFile(join(recorder.histories, "dotGoalWorkflow-pre-test-id.json"), fixtures(0)["dotGoalWorkflow.json"]!);
+    const before = await snapshot(recorder.histories);
+    const hook = await recorderFaults(recorder);
+    const result = await record(recorder, fixtures(2), ["--patched-change"], 0, hook);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("EEXIST");
+    expect(await snapshot(recorder.histories)).toEqual(before);
+  });
+
+  it("preserves the publication error if removing its new archive also fails", async () => {
+    const recorder = await createRecorder();
+    const initial = fixtures(1);
+    expect((await record(recorder, initial)).status).toBe(0);
+    const hook = await recorderFaults(recorder, { publication: true, archiveCleanup: true });
+    const result = await record(recorder, fixtures(2), ["--patched-change"], 0, hook);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("fixture-publication-original-error");
+    expect(result.stderr).toContain("EPUBLISH");
+    expect(result.stderr).not.toContain("archive-cleanup-secondary-error");
+    expect(await snapshot(recorder.histories)).toEqual({
+      ...initial,
+      "dotGoalWorkflow-pre-test-id.json": initial["dotGoalWorkflow.json"]
+    });
+  });
+
+  it("removes a partially written archive without changing live or older histories", async () => {
+    const recorder = await createRecorder();
+    expect((await record(recorder, fixtures(1))).status).toBe(0);
+    await writeFile(join(recorder.histories, "dotGoalWorkflow-pre-older-id.json"), fixtures(0)["dotGoalWorkflow.json"]!);
+    const before = await snapshot(recorder.histories);
+    const hook = await recorderFaults(recorder, { archiveWrite: true });
+    const result = await record(recorder, fixtures(2), ["--patched-change"], 0, hook);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("archive-write-original-error");
+    expect(result.stderr).toContain("EARCHIVE");
+    expect(await snapshot(recorder.histories)).toEqual(before);
+  });
+
+  it("preserves the publication error if staging cleanup also fails", async () => {
+    const recorder = await createRecorder();
+    expect((await record(recorder, fixtures(1))).status).toBe(0);
+    await writeFile(join(recorder.histories, "dotGoalWorkflow-pre-older-id.json"), fixtures(0)["dotGoalWorkflow.json"]!);
+    const before = await snapshot(recorder.histories);
+    const hook = await recorderFaults(recorder, { publication: true, stagingCleanup: true });
+    const result = await record(recorder, fixtures(2), ["--patched-change"], 0, hook);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("fixture-publication-original-error");
+    expect(result.stderr).toContain("EPUBLISH");
+    expect(result.stderr).not.toContain("staging-cleanup-secondary-error");
+    expect(await snapshot(recorder.histories)).toEqual(before);
   });
 });

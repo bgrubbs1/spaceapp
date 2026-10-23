@@ -1,6 +1,5 @@
 // Usage: npm run temporal:record-histories -w @space/worker [-- --patched-change]
-import { constants } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -20,6 +19,7 @@ const target = fileURLToPath(directory);
 await mkdir(target, { recursive: true });
 const staging = await mkdtemp(join(target, ".record-"));
 if (dirname(staging) !== target.replace(/[\\/]$/, "")) throw new Error("Unexpected staging directory");
+let finished = false;
 try {
   const result = spawnSync(process.execPath, [cli, "run", "tests/temporal-turn-goal.test.ts", "tests/temporal-memory.test.ts", "tests/temporal-supervisor.test.ts"], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
@@ -33,13 +33,31 @@ try {
     const recorded = await readdir(staging);
     for (const file of expected) if (!recorded.includes(file)) throw new Error(`Recorder did not produce ${file}`);
     for (const file of expected) {
-      if (files.includes(file)) {
-        const archive = `${file.slice(0, -5)}-pre-${randomUUID()}.json`;
-        await copyFile(join(target, file), join(target, archive), constants.COPYFILE_EXCL);
+      let archive;
+      let archiveHandle;
+      try {
+        if (files.includes(file)) {
+          const bytes = await readFile(join(target, file));
+          const candidate = join(target, `${file.slice(0, -5)}-pre-${randomUUID()}.json`);
+          archiveHandle = await open(candidate, "wx");
+          // Only a successful exclusive open gives us an archive to clean up.
+          archive = candidate;
+          await archiveHandle.writeFile(bytes);
+          await archiveHandle.close();
+          archiveHandle = undefined;
+        }
+        await rename(join(staging, file), join(target, file));
+      } catch (error) {
+        if (archiveHandle) await archiveHandle.close().catch(() => undefined);
+        if (archive) await rm(archive, { force: true }).catch(() => undefined);
+        throw error;
       }
-      await rename(join(staging, file), join(target, file));
     }
   }
+  finished = true;
 } finally {
-  await rm(staging, { recursive: true, force: true });
+  const cleanup = rm(staging, { recursive: true, force: true });
+  // Keep the original recording or publication error if cleanup also fails.
+  if (finished) await cleanup;
+  else await cleanup.catch(() => undefined);
 }
